@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	mqtt "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mitchellh/mapstructure"
 )
 
@@ -134,7 +134,7 @@ func newJeeNodeDecoder(in <-chan event, dev, nid string, fields []interface{}) {
 
 // TODO everything below is shared with the hub, should be in a common package!
 
-var hub *mqtt.Client
+var hub mqtt.Client
 
 // connectToHub sets up an MQTT client and registers as a "jet/..." client.
 // Uses last-will to automatically unregister on disconnect. This returns a
@@ -208,7 +208,7 @@ func (e *event) Decode(result interface{}) bool {
 func topicWatcher(pattern string) <-chan event {
 	feed := make(chan event)
 
-	t := hub.Subscribe(pattern, 0, func(hub *mqtt.Client, msg mqtt.Message) {
+	t := hub.Subscribe(pattern, 0, func(hub mqtt.Client, msg mqtt.Message) {
 		feed <- event{
 			Topic:    msg.Topic(),
 			Payload:  msg.Payload(),
