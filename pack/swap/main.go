@@ -1,15 +1,142 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"time"
+	"errors"
+	"math"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/mitchellh/mapstructure"
+	"github.com/spf13/viper"
 )
+
+type SwapFunction byte
+
+const (
+	STATUS  SwapFunction = 0
+	QUERY                = 1
+	COMMAND              = 2
+)
+
+type SwapValueType string
+
+const (
+	INT8    SwapValueType = "int8"
+	UINT8                 = "uint8"
+	INT16                 = "int16"
+	UINT16                = "uint16"
+	INT32                 = "int32"
+	UINT32                = "uint32"
+	FLOAT                 = "float"
+	CSTRING               = "cstring"
+	PSTRING               = "pstring"
+)
+
+type SwapPacket struct {
+	RSSI		byte
+	LQI		byte
+	Source          byte
+	Destination     byte
+	Hops            byte
+	Security        byte
+	Nonce           byte
+	Function        SwapFunction
+	RegisterAddress byte
+	RegisterID      byte
+	Payload         []byte
+}
+
+type SwapRegister struct {
+	Address byte
+	RawData []byte
+}
+
+type SwapValue struct {
+	Name     string
+	Register byte
+	Position byte
+	Type     SwapValueType
+	Unit     string
+	Offset   int
+	Scale    int
+	RawData  []byte
+}
+
+func (value *SwapValue) SetRawData(data []byte) {
+	var l byte
+	switch value.Type {
+	case INT8:
+		l = 1
+	case UINT8:
+		l = 1
+	case INT16:
+		l = 2
+	case UINT16:
+		l = 2
+	case INT32:
+		l = 4
+	case UINT32:
+		l = 4
+	}
+	value.RawData = data[value.Position : value.Position+l]
+}
+
+func (value *SwapValue) AsInt() (n int64, err error) {
+	switch value.Type {
+	case INT8:
+		n = int64(value.RawData[0])
+	case UINT8:
+		n = int64(value.RawData[0])
+	case INT16:
+		n = int64(binary.BigEndian.Uint16(value.RawData[0:2]))
+	case UINT16:
+		n = int64(binary.BigEndian.Uint16(value.RawData[0:2]))
+	case INT32:
+		n = int64(binary.BigEndian.Uint32(value.RawData[0:4]))
+	case UINT32:
+		n = int64(binary.BigEndian.Uint32(value.RawData[0:4]))
+	default:
+		err = errors.New("Value not an integer")
+	}
+	return
+}
+
+func (value *SwapValue) String() string {
+	n, err := value.AsInt()
+	if err == nil {
+		if value.Scale == 1 {
+			return fmt.Sprintf("%d", n - int64(value.Offset))
+		} else {
+			w := int(math.Log10(float64(value.Scale)))
+			return fmt.Sprintf("%.*f", w, float64(n) / float64(value.Scale) - float64(value.Offset))
+		}
+	}
+	return ""
+}
+
+type SwapMote struct {
+	Address   byte
+	Location  string
+	Registers []SwapRegister
+	Values    []SwapValue
+}
+
+func (mote *SwapMote) UpdateValues(p *SwapPacket) {
+	for _, value := range mote.Values {
+		if value.Register == p.RegisterID {
+			value.SetRawData(p.Payload)
+			log.Printf("/" + mote.Location + "/" + value.Name + ": " + value.String())
+		}
+	}
+}
+
+var motes []SwapMote
 
 func main() {
 	// omit timestamps from the Log and send output to stdout
@@ -27,7 +154,9 @@ func main() {
 	}
 
 	// normal pack startup begins here
-	log.Printf("SWAP pack starting, listening for %s\n", os.Args[1])
+	log.Printf("SWAP pack starting, listening for %s, mote directory at %s\n", os.Args[1], os.Args[2])
+
+	readMotes(os.Args[2])
 
 	// connect to MQTT and wait for it before doing anything else
 	connectToHub(packName, mqttPort, true)
@@ -38,24 +167,23 @@ func main() {
 	<-done // hang around forever
 }
 
-type SwapFunction byte
-
-const (
-	STATUS  SwapFunction = 0
-	QUERY                = 1
-	COMMAND              = 2
-)
-
-type SwapPacket struct {
-	Source          byte
-	Destination     byte
-	Hops            byte
-	Security        byte
-	Nonce           byte
-	Function        SwapFunction
-	RegisterAddress byte
-	RegisterID      byte
-	Payload         []byte
+func readMotes(moteDir string) {
+	files, _ := filepath.Glob(moteDir + "/*")
+	motes = make([]SwapMote, len(files))
+	for i, file := range files {
+		log.Printf("Reading from %s\n", file)
+		viper.SetConfigFile(file)
+		err := viper.ReadInConfig()
+		if err != nil {
+			log.Fatalf("Failed to parse mote config: %v\n", err)
+		}
+		viper.UnmarshalKey("general", &motes[i])
+		viper.UnmarshalKey("values", &motes[i].Values)
+		log.Printf("Mote %d: Location %s\n", motes[i].Address, motes[i].Location)
+		for _, value := range motes[i].Values {
+			log.Printf("    Value: %s, type: %v\n", value.Name, value.Type)
+		}
+	}
 }
 
 func hexByteToByte(data byte) byte {
@@ -85,29 +213,46 @@ func hexBytesToSwapFunction(data []byte) SwapFunction {
 	return STATUS
 }
 
-func swapListener(feed string) {
-	//feedMap := map[string]<-chan event{}
+func handlePacket(p *SwapPacket) {
+	for _, mote := range motes {
+		if mote.Address == p.RegisterAddress {
+			mote.UpdateValues(p)
+		}
+	}
+}
 
+func decodeSwapData(data []byte, p *SwapPacket) error {
+	minLength := 1+2*2+1+7*2
+	l := len(data)
+	if l >= minLength {
+		p.RSSI = hexBytesToByte(data[1:3])
+		p.LQI = hexBytesToByte(data[3:5])
+		p.Source = hexBytesToByte(data[6:8])
+		p.Destination = hexBytesToByte(data[8:10])
+		p.Hops = hexByteToByte(data[10])
+		p.Security = hexByteToByte(data[11])
+		p.Nonce = hexBytesToByte(data[12:14])
+		p.Function = hexBytesToSwapFunction(data[14:16])
+		p.RegisterAddress = hexBytesToByte(data[16:18])
+		p.RegisterID = hexBytesToByte(data[18:20])
+		if l > minLength {
+			p.Payload = make([]byte, (l-minLength)/2, (l-minLength)/2)
+			for i, _ := range p.Payload {
+				p.Payload[i] = hexBytesToByte(data[minLength+i*2 : minLength+(i+1)*2])
+			}
+		}
+		s, _ := json.Marshal(p)
+		log.Printf("%s\n", s)
+		return nil
+	}
+	return errors.New("Invalid SWAP data")
+}
+
+func swapListener(feed string) {
 	for evt := range topicWatcher(feed) {
 		var p SwapPacket
-		l := len(evt.Payload)
-		if l >= 14 {
-			p.Source = hexBytesToByte(evt.Payload[0:2])
-			p.Destination = hexBytesToByte(evt.Payload[2:4])
-			p.Hops = hexByteToByte(evt.Payload[4])
-			p.Security = hexByteToByte(evt.Payload[5])
-			p.Nonce = hexBytesToByte(evt.Payload[6:8])
-			p.Function = hexBytesToSwapFunction(evt.Payload[8:10])
-			p.RegisterAddress = hexBytesToByte(evt.Payload[10:12])
-			p.RegisterID = hexBytesToByte(evt.Payload[12:14])
-			if l > 14 {
-				p.Payload = make([]byte, (l-14)/2, (l-14)/2)
-				for i, _ := range p.Payload {
-					p.Payload[i] = hexBytesToByte(evt.Payload[14+i*2 : 14+(i+1)*2])
-				}
-			}
-			s, _ := json.Marshal(p)
-			log.Printf("%s\n", s)
+		if err := decodeSwapData(evt.Payload, &p); err == nil {
+			handlePacket(&p)
 		}
 	}
 }
